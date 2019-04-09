@@ -1,0 +1,367 @@
+//
+// From Data Prefetching Championship Simulator 2
+// Seth Pugsley, seth.h.pugsley@intel.com
+//
+
+/*
+
+  This file describes an Instruction Pointer-based (Program Counter-based) stride prefetcher.  
+  The prefetcher detects stride patterns coming from the same IP, and then 
+  prefetches additional cache lines.
+
+  Prefetches are issued into the L2 or LLC depending on L2 MSHR occupancy.
+
+ */
+#include <bitset>
+#include <math.h>
+#include "cache.h"
+
+// define testing variables
+
+
+#define ADDR_SEGMENT 16 // number of address segement
+
+#define OUT_CLASS 16 // =  2 ^ (64/OUT_DELTA)
+#define OUT_SHIFT 4 // log2 OUT_CLASS
+#define ALPHA 1  
+#define PREFETCH_DEGREE 1
+
+// define weight matrix
+
+double ADDR_weight_1 [ADDR_SEGMENT][OUT_CLASS]; 
+double SIGN_weight_1 [ADDR_SEGMENT];
+
+
+double ADDR_weight_2 [ADDR_SEGMENT][OUT_CLASS]; 
+double SIGN_weight_2 [ADDR_SEGMENT];
+
+class INFO_TUPLE {
+	public:
+	  uint64_t last_addr;
+	  uint64_t last_ip;
+	  uint64_t last_pred;
+	  int fetch_count;
+	  int correct_pred;
+	  int last_sign_1;
+	  int last_sign_2;
+
+	  INFO_TUPLE () {
+		  last_addr = 0;
+		  last_ip = 0;
+		  last_pred = 0;
+		  fetch_count = 0;
+		  correct_pred = 0;
+		  last_sign_1 = 1;
+		  last_sign_2 = 1;
+
+	  };
+};
+INFO_TUPLE last_pred_info;
+
+// function for update weight
+void weight_update(uint64_t addr, uint64_t ip) // modify PC_weight, ADDR_weight
+{
+	//wm new = wm old -a (d-r) f(x)
+	
+	uint64_t pa_mask = 0xffffffffffffffff << LOG2_BLOCK_SIZE;
+	if ((addr & pa_mask)==(last_pred_info.last_pred & pa_mask)){
+		last_pred_info.correct_pred += 1;
+	}
+
+	uint64_t addr_seg [ADDR_SEGMENT];
+	int addr_seg_len = 64/ADDR_SEGMENT;
+	
+	// making input vector
+
+	uint64_t addr_mask = (1 << addr_seg_len) - 1;
+	int j;
+
+	for (j=0;j<ADDR_SEGMENT;j++){
+		addr_seg [j] = (last_pred_info.last_addr >> (j*addr_seg_len)) & addr_mask;
+	}
+	
+	
+	// get delta vector and sign;
+
+	int sign_1, sign_2;
+	uint64_t delta_class_1, delta_class_2;
+	
+	uint64_t addr_seg_last = (addr >> LOG2_BLOCK_SIZE) & ((1<<OUT_SHIFT)-1);
+	uint64_t prev_seg_last = (last_pred_info.last_addr >> LOG2_BLOCK_SIZE) & ((1<<OUT_SHIFT)-1);
+	
+	if(addr_seg_last>=prev_seg_last){
+		sign_1 = 1;
+		delta_class_1 = addr_seg_last - prev_seg_last;
+	}else{
+		sign_1 = -1;
+		delta_class_1 = prev_seg_last - addr_seg_last;
+	}
+	
+	addr_seg_last = (addr >> (LOG2_BLOCK_SIZE+OUT_SHIFT)) & ((1<<OUT_SHIFT)-1);
+	prev_seg_last = (last_pred_info.last_addr >> (LOG2_BLOCK_SIZE+OUT_SHIFT)) & ((1<<OUT_SHIFT)-1);
+	
+	if(addr_seg_last>=prev_seg_last){
+		sign_2 = 1;
+		delta_class_2 = addr_seg_last - prev_seg_last;
+	}else{
+		sign_2 = -1;
+		delta_class_2 = prev_seg_last - addr_seg_last;
+	}
+	
+
+	int n;
+	for (n=0;n<OUT_CLASS;n++){
+		if(n == delta_class_1){
+			for (j= 0; j<ADDR_SEGMENT;j++){
+				if(ADDR_weight_1[j][n] <= 32767){
+					ADDR_weight_1[j][n] = ADDR_weight_1[j][n] + ALPHA * double(addr_seg[j]);
+			
+				}
+			}
+
+		}else{
+			for (j= 0; j<ADDR_SEGMENT;j++){
+				if(ADDR_weight_1[j][n] >= -32767){
+					ADDR_weight_1[j][n] = ADDR_weight_1[j][n] - ALPHA * double(addr_seg[j]);
+			
+				}
+			}
+
+		}
+	}
+	
+	for (n=0;n<OUT_CLASS;n++){
+		if(n == delta_class_2){
+			for (j= 0; j<ADDR_SEGMENT;j++){
+				ADDR_weight_2[j][n] = ADDR_weight_2[j][n] + ALPHA * double(addr_seg[j]);
+			}
+
+		}else{
+			for (j= 0; j<ADDR_SEGMENT;j++){
+				ADDR_weight_2[j][n] = ADDR_weight_2[j][n] - ALPHA * double(addr_seg[j]);
+			}
+
+		}
+	}
+	
+	// update sign weight
+
+	if(sign_1 != last_pred_info.last_sign_1){
+		if(sign_1 >= last_pred_info.last_sign_1){
+			for (j= 0; j<ADDR_SEGMENT;j++){
+				SIGN_weight_1[j] = SIGN_weight_1[j] + ALPHA * double(addr_seg[j]);
+			}
+		}else{
+			for(j= 0; j<ADDR_SEGMENT;j++){
+				SIGN_weight_1[j] = SIGN_weight_1[j] - ALPHA * double(addr_seg[j]);
+			}
+		}
+	}
+	if(sign_2 != last_pred_info.last_sign_2){
+		if(sign_2 >= last_pred_info.last_sign_2){
+			for (j= 0; j<ADDR_SEGMENT;j++){
+				SIGN_weight_2[j] = SIGN_weight_2[j] + ALPHA * double(addr_seg[j]);
+			}
+		}else{
+			for(j= 0; j<ADDR_SEGMENT;j++){
+				SIGN_weight_2[j] = SIGN_weight_2[j] - ALPHA * double(addr_seg[j]);
+			}
+		}
+	}
+	
+	
+}
+uint64_t perceptron_predict(uint64_t addr, uint64_t ip){
+
+	uint64_t addr_seg [ADDR_SEGMENT];
+
+
+	int addr_seg_len = 64/ADDR_SEGMENT;
+
+	// making input vector
+
+
+	uint64_t addr_mask = (1 << addr_seg_len) - 1;
+	int i,j;
+
+	for (j=0;j<ADDR_SEGMENT;j++){
+		addr_seg [j] = (addr >> (j*addr_seg_len)) & addr_mask;
+	}
+	
+	double pred_delta_1 [OUT_CLASS];
+	double pred_delta_2 [OUT_CLASS];
+	
+	// getting output
+
+	for (int n = 0; n <OUT_CLASS; n++){
+		double y = 0;
+
+		for(j=0;j<ADDR_SEGMENT;j++){
+			y = y + ADDR_weight_1[j][n] * addr_seg[j];
+		}
+		pred_delta_1[n] = y;
+	}
+	
+	for (int n = 0; n <OUT_CLASS; n++){
+		double y = 0;
+		for(j=0;j<ADDR_SEGMENT;j++){
+			y = y + ADDR_weight_2[j][n] * addr_seg[j];
+		}
+		pred_delta_2[n] = y;
+	}
+
+	// what is the largest delta
+
+	double best_m = pred_delta_1[0];
+	uint64_t best_class_1 = 0;
+	for(int n =0; n<OUT_CLASS; n++){
+		if (pred_delta_1[n] > best_m){
+			best_m = pred_delta_1[n];
+			best_class_1 = n;
+		}
+	}
+	uint64_t best_class_2 = 0;
+	best_m = pred_delta_2[0];
+	for(int n =0; n<OUT_CLASS; n++){
+		if (pred_delta_2[n] > best_m){
+			best_m = pred_delta_2[n];
+			best_class_2 = n;
+		}
+	}
+	// what is the sign
+
+	int y_sign = 0;
+	int sign_1, sign_2;
+	for(j=0;j<ADDR_SEGMENT;j++){
+		y_sign = y_sign + SIGN_weight_1[j]*addr_seg[j];
+	}	
+
+	if(y_sign >=0){
+		sign_1= 1; // adder
+		last_pred_info.last_sign_1 = 1;
+	}else{
+		sign_1 = 0; //subtracter 
+		last_pred_info.last_sign_1 = 0;
+	}
+	
+	y_sign =0;
+	for(j=0;j<ADDR_SEGMENT;j++){
+		y_sign = y_sign + SIGN_weight_2[j]*addr_seg[j];
+	}	
+	if(y_sign >=0){
+		sign_2 = 1; // adder
+		last_pred_info.last_sign_2 = 1;
+	}else{
+		sign_2 = 0; //subtracter 
+		last_pred_info.last_sign_2 = 0;
+	}
+	
+	
+	// get the predicted address:
+
+	uint64_t addr_pred_ret;
+	if(sign_1 == 1){
+		addr_pred_ret = addr + (best_class_1 << LOG2_BLOCK_SIZE);
+	}else{
+		addr_pred_ret = addr - (best_class_1 << LOG2_BLOCK_SIZE);
+	}
+	
+	if(sign_2 == 1){
+		addr_pred_ret = addr_pred_ret + (best_class_2 << (LOG2_BLOCK_SIZE+OUT_SHIFT));
+	}else{
+		addr_pred_ret = addr_pred_ret - (best_class_2 << (LOG2_BLOCK_SIZE+OUT_SHIFT));
+	}
+	
+	
+	//printf("current addr: %llx, predicted addr: %llx, delta_1: %llx, delta_2: %llx \n", addr, addr_pred_ret,best_class_1, best_class_2);
+	return addr_pred_ret;
+	
+}
+
+void CACHE::l2c_prefetcher_initialize() 
+{
+    cout << "CPU " << cpu << " L2C IP-based stride prefetcher" << endl;
+    // initialize all weight
+ 
+    for(int n = 0; n < OUT_CLASS;n++){
+
+   		for (int j=0; j< ADDR_SEGMENT; j++){
+        	ADDR_weight_1[j][n] = 0;
+        	ADDR_weight_2[j][n] = 0;
+
+        	SIGN_weight_1[j] = 0; 
+        	SIGN_weight_2[j] = 0; 
+
+        }
+    }
+    
+    
+}
+
+
+void CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type)
+{
+	// update weight if not hit
+    if (addr != last_pred_info.last_pred){
+    	//printf("updating weight\n");
+    	weight_update(addr,ip);
+    }else{
+		last_pred_info.correct_pred += 1;
+    }
+    // generate prediction
+    uint64_t pred_addr;
+    pred_addr = perceptron_predict(addr, ip);
+        
+
+    // generate prefetch
+
+	uint64_t pa_mask = 0xffffffffffffffff << LOG2_BLOCK_SIZE;
+    uint64_t pf_address = pred_addr & pa_mask;
+
+    // update prefetch next info
+    last_pred_info.last_addr = addr;
+    last_pred_info.last_ip = ip;
+    last_pred_info.last_pred = pred_addr;
+	
+    // only issue a prefetch if the prefetch address is in the same 4 KB page
+    // as the current demand access address
+    if ((pf_address >> LOG2_PAGE_SIZE) == (addr >> LOG2_PAGE_SIZE)){
+        // check the MSHR occupancy to decide if we're going to prefetch to the L2 or LLC
+    	last_pred_info.fetch_count += 1;
+    	if (MSHR.occupancy < (MSHR.SIZE>>1))
+         	prefetch_line(ip, addr, pf_address, FILL_L2);
+    	else
+         	prefetch_line(ip, addr, pf_address, FILL_LLC);
+    	
+    }
+    
+    // prefetch degree
+    
+    for(int i =1; i<PREFETCH_DEGREE; i++){
+    	pred_addr = perceptron_predict(pred_addr, ip);
+    	pf_address = pred_addr & pa_mask;
+    	
+    	if ((pf_address >> LOG2_PAGE_SIZE) == (addr >> LOG2_PAGE_SIZE)){
+    		last_pred_info.fetch_count += 1;
+    		if (MSHR.occupancy < (MSHR.SIZE>>1))
+        		prefetch_line(ip, addr, pf_address, FILL_L2);
+    		else
+         		prefetch_line(ip, addr, pf_address, FILL_LLC);	
+    	}
+    	
+    }
+
+
+
+}
+
+void CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr)
+{
+
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+    cout << "CPU " << cpu << " L2C PC-based stride prefetcher final stats" << endl;
+	printf("total fetch: %d, total correct prediction: %d \n", last_pred_info.fetch_count, last_pred_info.correct_pred);
+}
